@@ -46,7 +46,7 @@ Local Setup
 
 Clone the repository
 
-git clone [https://github.com/yourusername/fight-iq.git](https://github.com/yourusername/fight-iq.git)
+git clone [https://github.com/yourusername/fight-iq.git](https://github.com/marib-alam/fight-iq.git)
 cd fight-iq
 
 
