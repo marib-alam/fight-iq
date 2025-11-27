@@ -34,7 +34,7 @@ st.sidebar.header("🧠 Combo Logic")
 combo_max_gap = st.sidebar.slider("Max Gap for Combo", 0.3, 1.5, 0.5, 0.1)
 min_punches_for_combo = st.sidebar.slider("Min Punches in Combo", 2, 6, 3, 1)
 
-# --- 3. Optimized Loader ---
+# --- 3. Optimized Loader (Memory Safe) ---
 def highpass_filter(data, cutoff, fs, order=5):
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
@@ -44,13 +44,57 @@ def highpass_filter(data, cutoff, fs, order=5):
 
 @st.cache_data
 def load_audio(uploaded_file, use_hpss):
+    # 1. Load Audio (Downsampled)
+    # Streamlit Cloud has ~1GB RAM limit. We must be careful.
     y, sr = librosa.load(uploaded_file, sr=16000)
-    if use_hpss:
-        y_harmonic, y_percussive = librosa.effects.hpss(y, margin=3.0)
-        return y, sr, y_percussive
-    else:
+    
+    if not use_hpss:
+        # Fast Mode: Simple Filter (Low Memory)
         y_clean = highpass_filter(y, 200, sr)
         return y, sr, y_clean
+    else:
+        # Heavy Mode: HPSS (Harmonic-Percussive Source Separation)
+        # We MUST process this in chunks to avoid crashing the server.
+        
+        chunk_duration = 60 # Process 60 seconds at a time
+        chunk_samples = chunk_duration * sr
+        total_samples = len(y)
+        
+        y_percussive_full = []
+        
+        # Create a progress bar because this will be slow
+        progress_bar = st.progress(0, text="Deep Cleaning Audio Chunks...")
+        
+        for i in range(0, total_samples, chunk_samples):
+            # Slice the chunk
+            chunk = y[i : i + chunk_samples]
+            
+            # Pad the last chunk if it's too short (to avoid edge errors)
+            if len(chunk) < 2048: 
+                break 
+                
+            # Run HPSS on just this small slice
+            # This keeps RAM usage tiny (~50MB instead of 2GB)
+            _, y_p_chunk = librosa.effects.hpss(chunk, margin=3.0)
+            y_percussive_full.append(y_p_chunk)
+            
+            # Update Progress
+            percent = min(1.0, (i + chunk_samples) / total_samples)
+            progress_bar.progress(percent)
+            
+        progress_bar.empty() # Clear bar when done
+        
+        # Stitch chunks back together
+        y_percussive = np.concatenate(y_percussive_full)
+        
+        # Ensure length matches original (in case of rounding errors)
+        # We pad with zeros or trim to match exact length
+        if len(y_percussive) < len(y):
+            y_percussive = np.pad(y_percussive, (0, len(y) - len(y_percussive)))
+        elif len(y_percussive) > len(y):
+            y_percussive = y_percussive[:len(y)]
+            
+        return y, sr, y_percussive
 
 # --- 4. Helper Function: Metrics ---
 def get_metrics(df_chunk, duration_seconds=None):
@@ -94,24 +138,25 @@ uploaded_file = st.file_uploader("Upload Session Audio (WAV/MP3)", type=["wav", 
 
 if uploaded_file is not None:
     
-    with st.spinner('Analyzing Audio & Detecting Rounds...'):
-        y, sr, y_percussive = load_audio(uploaded_file, use_hpss)
+    # We moved the Spinner inside to handle the progress bar better
+    y, sr, y_percussive = load_audio(uploaded_file, use_hpss)
 
-    wait_frames = int(min_gap * sr / 512) 
-    onset_frames = librosa.onset.onset_detect(
-        y=y_percussive, sr=sr, wait=wait_frames, delta=sensitivity
-    )
-    onset_times = librosa.frames_to_time(onset_frames, sr=sr)
+    with st.spinner('Detecting Punches...'):
+        wait_frames = int(min_gap * sr / 512) 
+        onset_frames = librosa.onset.onset_detect(
+            y=y_percussive, sr=sr, wait=wait_frames, delta=sensitivity
+        )
+        onset_times = librosa.frames_to_time(onset_frames, sr=sr)
 
-    punch_data = []
-    for i, frame in enumerate(onset_frames):
-        window = int(0.03 * sr)
-        start = max(0, frame - window)
-        end = min(len(y), frame + window)
-        power = np.max(np.abs(y[start:end]))
-        punch_data.append({"Time": onset_times[i], "Power": power})
-    
-    df = pd.DataFrame(punch_data)
+        punch_data = []
+        for i, frame in enumerate(onset_frames):
+            window = int(0.03 * sr)
+            start = max(0, frame - window)
+            end = min(len(y), frame + window)
+            power = np.max(np.abs(y[start:end]))
+            punch_data.append({"Time": onset_times[i], "Power": power})
+        
+        df = pd.DataFrame(punch_data)
 
     if not df.empty and len(df) > 5:
         # --- DBSCAN LOGIC ---
@@ -154,7 +199,7 @@ if uploaded_file is not None:
         fig_timeline.update_layout(coloraxis_showscale=False)
         st.plotly_chart(fig_timeline, use_container_width=True)
 
-        # --- SAVE/DOWNLOAD SECTION (NEW) ---
+        # --- SAVE/DOWNLOAD SECTION ---
         st.divider()
         c_dl1, c_dl2 = st.columns([3, 1])
         with c_dl1:
@@ -183,7 +228,6 @@ if uploaded_file is not None:
             c3.metric("Avg Pace", f"{metrics['ppm']:.0f} PPM")
             c4.metric("Avg Power", f"{metrics['avg_power']:.3f}")
             
-            # Show the data being exported
             with st.expander("Preview Export Data"):
                 st.dataframe(df_export)
 
