@@ -1,0 +1,1 @@
+streamlit librosa numpy pandas plotly scipy scikit-learn
