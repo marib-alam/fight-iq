@@ -1,1 +1,7 @@
-streamlit librosa numpy pandas plotly scipy scikit-learn
+streamlit
+librosa
+numpy
+pandas
+plotly
+scipy
+scikit-learn
