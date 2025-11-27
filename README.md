@@ -90,4 +90,4 @@ Round Separation: Instead of hard-coded timers, we calculate the time gaps betwe
 
 📄 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the GPL-3.0 license - see the LICENSE file for details.
