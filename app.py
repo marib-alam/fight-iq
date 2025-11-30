@@ -3,6 +3,7 @@ import librosa
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import scipy.signal
 from sklearn.cluster import DBSCAN
 from datetime import datetime
@@ -16,13 +17,14 @@ st.markdown("_Upload a full session. Rounds are detected intelligently using Den
 
 # --- 2. Sidebar Controls ---
 st.sidebar.header("⚙️ Signal Tuning")
+# UPDATED: Default sensitivity set to 0.25
 sensitivity = st.sidebar.slider("Impact Sensitivity", 0.05, 0.80, 0.25, 0.01)
 min_gap = st.sidebar.slider("Debounce (Min Gap)", 0.05, 0.50, 0.15, 0.01)
 
 use_hpss = st.sidebar.checkbox(
     "Deep Noise Cleaning (Slow)", 
     value=False, 
-    help="Enable this ONLY if you have loud background music/traffic."
+    help="Enable this ONLY if you have constant background drone. The default 'Thud Filter' is usually better."
 )
 
 st.sidebar.divider()
@@ -31,69 +33,55 @@ max_pause = st.sidebar.slider("Max Pause Allowed (sec)", 10, 60, 30, 5)
 
 st.sidebar.divider()
 st.sidebar.header("🧠 Combo Logic")
-combo_max_gap = st.sidebar.slider("Max Gap for Combo", 0.3, 1.5, 0.5, 0.1)
+# UPDATED: Default combo gap set to 0.8
+combo_max_gap = st.sidebar.slider("Max Gap for Combo", 0.3, 1.5, 0.8, 0.1)
 min_punches_for_combo = st.sidebar.slider("Min Punches in Combo", 2, 6, 3, 1)
 
-# --- 3. Optimized Loader (Memory Safe) ---
-def highpass_filter(data, cutoff, fs, order=5):
+# --- 3. Optimized Loader (THE THUD FILTER) ---
+def bandpass_filter(data, lowcut, highcut, fs, order=5):
+    """
+    The 'Sonic Fingerprint' Filter.
+    It rejects everything except the specific frequency range of a heavy bag thud (100-500Hz).
+    Velcro (High Freq) and Rumble (Super Low Freq) are removed.
+    """
     nyq = 0.5 * fs
-    normal_cutoff = cutoff / nyq
-    b, a = scipy.signal.butter(order, normal_cutoff, btype='high', analog=False)
+    low = lowcut / nyq
+    high = highcut / nyq
+    # Create a Bandpass filter
+    b, a = scipy.signal.butter(order, [low, high], btype='band')
     y = scipy.signal.filtfilt(b, a, data)
     return y
 
 @st.cache_data
 def load_audio(uploaded_file, use_hpss):
-    # 1. Load Audio (Downsampled)
-    # Streamlit Cloud has ~1GB RAM limit. We must be careful.
     y, sr = librosa.load(uploaded_file, sr=16000)
     
     if not use_hpss:
-        # Fast Mode: Simple Filter (Low Memory)
-        y_clean = highpass_filter(y, 200, sr)
+        # --- THE FIX ---
+        # Apply the "Thud Gate" (100Hz - 500Hz) to match Live App logic
+        # This removes the "Clicky" velcro sounds before detection runs.
+        y_clean = bandpass_filter(y, 100, 500, sr)
         return y, sr, y_clean
     else:
-        # Heavy Mode: HPSS (Harmonic-Percussive Source Separation)
-        # We MUST process this in chunks to avoid crashing the server.
-        
-        chunk_duration = 60 # Process 60 seconds at a time
+        # Legacy Deep Clean (HPSS)
+        chunk_duration = 60 
         chunk_samples = chunk_duration * sr
         total_samples = len(y)
-        
         y_percussive_full = []
-        
-        # Create a progress bar because this will be slow
         progress_bar = st.progress(0, text="Deep Cleaning Audio Chunks...")
-        
         for i in range(0, total_samples, chunk_samples):
-            # Slice the chunk
             chunk = y[i : i + chunk_samples]
-            
-            # Pad the last chunk if it's too short (to avoid edge errors)
-            if len(chunk) < 2048: 
-                break 
-                
-            # Run HPSS on just this small slice
-            # This keeps RAM usage tiny (~50MB instead of 2GB)
+            if len(chunk) < 2048: break 
             _, y_p_chunk = librosa.effects.hpss(chunk, margin=3.0)
             y_percussive_full.append(y_p_chunk)
-            
-            # Update Progress
             percent = min(1.0, (i + chunk_samples) / total_samples)
             progress_bar.progress(percent)
-            
-        progress_bar.empty() # Clear bar when done
-        
-        # Stitch chunks back together
+        progress_bar.empty()
         y_percussive = np.concatenate(y_percussive_full)
-        
-        # Ensure length matches original (in case of rounding errors)
-        # We pad with zeros or trim to match exact length
         if len(y_percussive) < len(y):
             y_percussive = np.pad(y_percussive, (0, len(y) - len(y_percussive)))
         elif len(y_percussive) > len(y):
             y_percussive = y_percussive[:len(y)]
-            
         return y, sr, y_percussive
 
 # --- 4. Helper Function: Metrics ---
@@ -123,14 +111,15 @@ def get_metrics(df_chunk, duration_seconds=None):
         
     ppm = total_punches / (duration_seconds / 60)
 
+    # Convert everything to standard Python floats to avoid JSON errors
     return {
-        "punches": total_punches,
-        "combos": total_combos,
-        "avg_power": df_chunk['Power'].mean(),
-        "avg_tempo": avg_tempo,
-        "peak_rate": peak_rate,
-        "ppm": ppm,
-        "duration_sec": duration_seconds
+        "punches": int(total_punches),
+        "combos": int(total_combos),
+        "avg_power": float(df_chunk['Power'].mean()),
+        "avg_tempo": float(avg_tempo),
+        "peak_rate": float(peak_rate),
+        "ppm": float(ppm),
+        "duration_sec": float(duration_seconds)
     }
 
 # --- 5. Main Logic ---
@@ -138,8 +127,43 @@ uploaded_file = st.file_uploader("Upload Session Audio (WAV/MP3)", type=["wav", 
 
 if uploaded_file is not None:
     
-    # We moved the Spinner inside to handle the progress bar better
     y, sr, y_percussive = load_audio(uploaded_file, use_hpss)
+
+    # --- WAVEFORM VISUALIZER WITH DOTS ---
+    st.subheader("Audio Waveform & Detection")
+    
+    # 0. Audio Player (New Feature)
+    # We must rewind the file pointer because librosa read it to the end
+    uploaded_file.seek(0) 
+    st.audio(uploaded_file)
+
+    # 1. Downsample the wave for plotting (max 10k points for speed)
+    step = max(1, int(len(y_percussive) / 10000))
+    y_view = y_percussive[::step]
+    x_view = np.arange(len(y_view)) * (step / sr)
+    
+    fig_wave = go.Figure()
+    
+    # Add the Green Wave
+    fig_wave.add_trace(go.Scatter(
+        x=x_view, y=y_view,
+        mode='lines',
+        name='Signal',
+        line=dict(color='#00FF00', width=1),
+        fill='tozeroy'
+    ))
+
+    # We update the layout immediately but will add the dot trace later if detection happens
+    fig_wave.update_layout(
+        height=250, 
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(showgrid=False, title='Seconds'),
+        yaxis=dict(showgrid=False, showticklabels=False),
+        showlegend=True,
+        legend=dict(orientation="h", y=1.1)
+    )
 
     with st.spinner('Detecting Punches...'):
         wait_frames = int(min_gap * sr / 512) 
@@ -154,9 +178,23 @@ if uploaded_file is not None:
             start = max(0, frame - window)
             end = min(len(y), frame + window)
             power = np.max(np.abs(y[start:end]))
-            punch_data.append({"Time": onset_times[i], "Power": power})
+            # Ensure stored power is a standard float
+            punch_data.append({"Time": float(onset_times[i]), "Power": float(power)})
         
         df = pd.DataFrame(punch_data)
+
+    # Add the Orange Dots to the Waveform if punches exist
+    if not df.empty:
+        fig_wave.add_trace(go.Scatter(
+            x=df['Time'], 
+            y=df['Power'], # Place dot at the height of the punch power
+            mode='markers',
+            name='Detected Punch',
+            marker=dict(color='#FFA500', size=8, symbol='circle', line=dict(color='white', width=1)) 
+        ))
+    
+    # Now render the waveform chart
+    st.plotly_chart(fig_wave, use_container_width=True)
 
     if not df.empty and len(df) > 5:
         # --- DBSCAN LOGIC ---
@@ -171,10 +209,9 @@ if uploaded_file is not None:
         
         detected_rounds = len(unique_labels)
         
-        # --- CALCULATE METRICS FOR DOWNLOAD ---
+        # --- CALCULATE METRICS ---
         metrics = get_metrics(df, duration_seconds=len(y)/sr)
         
-        # Prepare Export Data (Single Row Summary)
         export_data = {
             "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "Filename": uploaded_file.name,
@@ -187,7 +224,6 @@ if uploaded_file is not None:
         }
         df_export = pd.DataFrame([export_data])
 
-        # --- DISPLAY ---
         st.toast(f"🤖 AI Detected {detected_rounds} Rounds")
         
         st.subheader("Session Timeline")
@@ -199,7 +235,42 @@ if uploaded_file is not None:
         fig_timeline.update_layout(coloraxis_showscale=False)
         st.plotly_chart(fig_timeline, use_container_width=True)
 
-        # --- SAVE/DOWNLOAD SECTION ---
+        # --- ROUND SUMMARY TABLE ---
+        st.subheader("📊 Round-by-Round Breakdown")
+        
+        rounds_summary = []
+        for r in unique_labels:
+            round_num = label_map[r]
+            df_round = df[df['Round'] == round_num].copy()
+            r_metrics = get_metrics(df_round)
+            
+            rounds_summary.append({
+                "Round": int(round_num),
+                "Punches": int(r_metrics['punches']),
+                "Combos": int(r_metrics['combos']),
+                "Pace (PPM)": int(round(r_metrics['ppm'])),
+                "Duration (s)": int(round(r_metrics['duration_sec'])),
+                "Avg Power": float(round(r_metrics['avg_power'], 4)),
+                "Peak Speed": float(round(r_metrics['peak_rate'], 1))
+            })
+            
+        df_rounds_summary = pd.DataFrame(rounds_summary)
+        
+        st.dataframe(
+            df_rounds_summary, 
+            hide_index=True,
+            column_config={
+                "Round": st.column_config.NumberColumn(format="R %d"),
+                "Avg Power": st.column_config.ProgressColumn(
+                    format="%.4f", 
+                    min_value=0.0, 
+                    max_value=float(df['Power'].max())
+                ),
+            },
+            use_container_width=True
+        )
+
+        # --- SAVE/DOWNLOAD ---
         st.divider()
         c_dl1, c_dl2 = st.columns([3, 1])
         with c_dl1:
@@ -208,7 +279,7 @@ if uploaded_file is not None:
         with c_dl2:
             csv = df_export.to_csv(index=False).encode('utf-8')
             st.download_button(
-                label="Download Session Report (CSV)",
+                label="Download Report (CSV)",
                 data=csv,
                 file_name=f"fight_iq_{datetime.now().strftime('%Y%m%d')}.csv",
                 mime="text/csv",
@@ -220,7 +291,6 @@ if uploaded_file is not None:
         tab_titles = ["📝 Full Summary"] + [f"Round {r}" for r in rounds]
         tabs = st.tabs(tab_titles)
 
-        # TAB 0: SUMMARY
         with tabs[0]:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Total Punches", metrics['punches'])
@@ -231,7 +301,6 @@ if uploaded_file is not None:
             with st.expander("Preview Export Data"):
                 st.dataframe(df_export)
 
-        # TAB X: ROUNDS
         for i, r in enumerate(rounds):
             with tabs[i+1]:
                 df_round = df[df['Round'] == r].copy()
@@ -258,3 +327,5 @@ if uploaded_file is not None:
                 
     else:
         st.warning("No punches found or session too short for clustering.")
+
+
