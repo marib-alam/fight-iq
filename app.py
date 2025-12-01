@@ -327,5 +327,3 @@ if uploaded_file is not None:
                 
     else:
         st.warning("No punches found or session too short for clustering.")
-
-
